@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"math"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -221,6 +222,70 @@ func TestListJobsFiltersByExactParticipant(t *testing.T) {
 	jobs, total, _ = st.ListJobs(ctx, "ali", 1, 20)
 	if total != 0 || len(jobs) != 0 {
 		t.Fatalf("partial match returned %v", idsOf(jobs))
+	}
+}
+
+func TestListJobsHugePageReturnsEmptyWithTotal(t *testing.T) {
+	st := openStore(t)
+	ctx := context.Background()
+
+	for _, id := range []string{"job-a", "job-b", "job-c"} {
+		reg := sampleRegistration()
+		reg.ID = id
+		if _, _, err := st.RegisterJob(ctx, reg); err != nil {
+			t.Fatalf("register %s: %v", id, err)
+		}
+	}
+
+	// The largest page number the platform int can represent must not wrap
+	// the offset computation into a negative or first-page offset.
+	for _, pageSize := range []int{1, 2, 100} {
+		jobs, total, err := st.ListJobs(ctx, "", math.MaxInt, pageSize)
+		if err != nil {
+			t.Fatalf("list page MaxInt size %d: %v", pageSize, err)
+		}
+		if total != 3 {
+			t.Fatalf("size %d: total = %d, want 3", pageSize, total)
+		}
+		if jobs == nil || len(jobs) != 0 {
+			t.Fatalf("size %d: jobs = %v, want empty non-nil page", pageSize, idsOf(jobs))
+		}
+	}
+
+	// The participant filter still applies to the reported total.
+	jobs, total, err := st.ListJobs(ctx, "alice", math.MaxInt, 2)
+	if err != nil {
+		t.Fatalf("filtered list: %v", err)
+	}
+	if total != 3 || len(jobs) != 0 {
+		t.Fatalf("filtered: total=%d len=%d, want total=3 empty page", total, len(jobs))
+	}
+	if _, total, _ = st.ListJobs(ctx, "nobody", math.MaxInt, 2); total != 0 {
+		t.Fatalf("no-match filter: total = %d, want 0", total)
+	}
+
+	// Boundary pages around the real data still behave normally.
+	last, total, err := st.ListJobs(ctx, "", 2, 2)
+	if err != nil || total != 3 || len(last) != 1 || last[0].ID != "job-c" {
+		t.Fatalf("last page = %v (total %d, err %v), want job-c", idsOf(last), total, err)
+	}
+	if next, _, _ := st.ListJobs(ctx, "", 3, 2); len(next) != 0 {
+		t.Fatalf("page after last = %v, want empty", idsOf(next))
+	}
+
+	// The queries above must not disturb stored content, stage or history.
+	all, total, err := st.ListJobs(ctx, "", 1, 20)
+	if err != nil || total != 3 || len(all) != 3 {
+		t.Fatalf("final list: total=%d len=%d err=%v", total, len(all), err)
+	}
+	for i, id := range []string{"job-a", "job-b", "job-c"} {
+		job := all[i]
+		if job.ID != id || job.Stage != StageRegistered ||
+			len(job.History) != 1 || job.History[0].Stage != StageRegistered ||
+			len(job.Participants) != 2 || job.Participants[0] != "alice" ||
+			len(job.InputRefs) != 2 || job.InputRefs[0] != "ref-a" {
+			t.Fatalf("job %d changed after paging queries: %+v", i, job)
+		}
 	}
 }
 

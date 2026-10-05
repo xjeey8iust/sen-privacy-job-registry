@@ -3,9 +3,12 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
@@ -235,6 +238,102 @@ func TestGetJobsPaginationAndOutOfRange(t *testing.T) {
 	}
 }
 
+func TestGetJobsAcceptsHugePageNumbers(t *testing.T) {
+	_, handler := newTestRouter(t)
+
+	// Empty database: a legal huge page is an empty page with total 0.
+	hugePage := strconv.Itoa(math.MaxInt)
+	rec := getJobs(handler, "/jobs?page="+hugePage+"&page_size=2")
+	assertPageEnvelope(t, rec, math.MaxInt, 2, 0, 0)
+
+	for i := 0; i < 3; i++ {
+		body := `{"id":"job-` + string(rune('a'+i)) + `","computation_type":"c","participants":["alice"],"input_refs":["r"]}`
+		if rec := postJobs(handler, body); rec.Code != http.StatusCreated {
+			t.Fatalf("setup: %d %s", rec.Code, rec.Body.String())
+		}
+	}
+
+	// The largest legal page number must echo back unchanged and return an
+	// empty page, never wrap to page 1 or fail, for every page size.
+	for _, size := range []int{1, 2, 100} {
+		target := "/jobs?page=" + hugePage + "&page_size=" + strconv.Itoa(size)
+		rec := getJobs(handler, target)
+		assertPageEnvelope(t, rec, math.MaxInt, size, 3, 0)
+		if !strings.Contains(rec.Body.String(), `"items":[]`) {
+			t.Fatalf("%s: items must serialize as [], body %s", target, rec.Body.String())
+		}
+	}
+
+	// The participant filter still applies to the reported total.
+	rec = getJobs(handler, "/jobs?participant=alice&page="+hugePage+"&page_size=2")
+	assertPageEnvelope(t, rec, math.MaxInt, 2, 3, 0)
+	rec = getJobs(handler, "/jobs?participant=nobody&page="+hugePage+"&page_size=2")
+	assertPageEnvelope(t, rec, math.MaxInt, 2, 0, 0)
+
+	// The ordinary last page still holds its record and the page right after
+	// it is empty.
+	rec = getJobs(handler, "/jobs?page=2&page_size=2")
+	assertPageEnvelope(t, rec, 2, 2, 3, 1)
+	rec = getJobs(handler, "/jobs?page=3&page_size=2")
+	assertPageEnvelope(t, rec, 3, 2, 3, 0)
+
+	// Leading zeros are accepted and echoed back as the parsed value.
+	rec = getJobs(handler, "/jobs?page=0002&page_size=02")
+	assertPageEnvelope(t, rec, 2, 2, 3, 1)
+
+	// None of the queries above changed stored content, stage or history.
+	rec = getJobs(handler, "/jobs")
+	var envelope struct {
+		Total int `json:"total"`
+		Items []struct {
+			ID      string `json:"id"`
+			Stage   string `json:"stage"`
+			History []struct {
+				Stage string `json:"stage"`
+			} `json:"history"`
+			Participants []string `json:"participants"`
+			InputRefs    []string `json:"input_refs"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode final list: %v", err)
+	}
+	if envelope.Total != 3 || len(envelope.Items) != 3 {
+		t.Fatalf("final list = %s", rec.Body.String())
+	}
+	for i, want := range []string{"job-a", "job-b", "job-c"} {
+		item := envelope.Items[i]
+		if item.ID != want || item.Stage != "registered" ||
+			len(item.History) != 1 || item.History[0].Stage != "registered" ||
+			len(item.Participants) != 1 || item.Participants[0] != "alice" ||
+			len(item.InputRefs) != 1 || item.InputRefs[0] != "r" {
+			t.Fatalf("item %d changed after paging queries: %s", i, rec.Body.String())
+		}
+	}
+}
+
+// assertPageEnvelope verifies a 200 GET /jobs response: the echoed page and
+// page_size, the filtered total and the number of returned items.
+func assertPageEnvelope(t *testing.T, rec *httptest.ResponseRecorder, page, pageSize, total, items int) {
+	t.Helper()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", rec.Code, rec.Body.String())
+	}
+	var envelope struct {
+		Total int               `json:"total"`
+		Page  int               `json:"page"`
+		Size  int               `json:"page_size"`
+		Items []json.RawMessage `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode envelope %q: %v", rec.Body.String(), err)
+	}
+	if envelope.Page != page || envelope.Size != pageSize || envelope.Total != total || len(envelope.Items) != items {
+		t.Fatalf("envelope = %s, want page=%d page_size=%d total=%d items=%d",
+			rec.Body.String(), page, pageSize, total, items)
+	}
+}
+
 func TestGetJobsRejectsInvalidPaging(t *testing.T) {
 	_, handler := newTestRouter(t)
 
@@ -306,6 +405,42 @@ func TestJobsEndpointsReturn503WhenStorageDown(t *testing.T) {
 		t.Fatalf("get status = %d, want 503", get.Code)
 	}
 	assertErrorCode(t, get, "storage_unavailable")
+}
+
+func TestGetJobsStorageDownAndParameterPriority(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "service.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	handler := NewRouter(st)
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// A legal huge page is still a legal query: storage failure wins.
+	rec := getJobs(handler, "/jobs?page="+strconv.Itoa(math.MaxInt)+"&page_size=2")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("huge page status = %d, want 503", rec.Code)
+	}
+	assertErrorCode(t, rec, "storage_unavailable")
+	var envelope struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode 503 body: %v", err)
+	}
+	if envelope.Error.Message != "database is not available" {
+		t.Fatalf("503 message = %q, want %q", envelope.Error.Message, "database is not available")
+	}
+
+	// Invalid parameters are rejected before the store is ever touched.
+	rec = getJobs(handler, "/jobs?page=abc")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid page with storage down: status = %d, want 400", rec.Code)
+	}
+	assertErrorCode(t, rec, "invalid_request")
 }
 
 func TestOverlappingPostRequestsLeaveSingleRecord(t *testing.T) {

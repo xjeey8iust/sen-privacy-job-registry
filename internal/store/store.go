@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 
@@ -219,6 +220,14 @@ func (s *Store) ListJobs(ctx context.Context, participant string, page, pageSize
 		return nil, 0, err
 	}
 
+	// A page whose offset cannot be represented as an int, or that starts past
+	// the last filtered row, is a valid empty page: the filtered total is
+	// still reported and no row query is needed.
+	offset, ok := pageOffset(page, pageSize)
+	if !ok || offset >= total {
+		return []*Job{}, total, nil
+	}
+
 	listQuery := `SELECT j.id, j.computation_type, j.participants, j.input_refs, j.stage
 		FROM jobs j`
 	if filter {
@@ -227,13 +236,24 @@ func (s *Store) ListJobs(ctx context.Context, participant string, page, pageSize
 			WHERE p.job_id = j.id AND p.participant = ?)`
 	}
 	listQuery += ` ORDER BY j.id COLLATE BINARY LIMIT ? OFFSET ?`
-	queryArgs := append(append([]any(nil), args...), pageSize, (page-1)*pageSize)
+	queryArgs := append(append([]any(nil), args...), pageSize, offset)
 
 	jobs, err := s.queryJobs(ctx, listQuery, queryArgs...)
 	if err != nil {
 		return nil, 0, err
 	}
 	return jobs, total, nil
+}
+
+// pageOffset converts a 1-based page number into a 0-based row offset. The
+// boolean result is false when (page-1)*pageSize would overflow int; such an
+// offset lies beyond any page the store can hold, so the page is empty by
+// construction.
+func pageOffset(page, pageSize int) (int, bool) {
+	if page-1 > math.MaxInt/pageSize {
+		return 0, false
+	}
+	return (page - 1) * pageSize, true
 }
 
 type queryer interface {
