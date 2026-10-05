@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 
@@ -227,13 +228,27 @@ func (s *Store) ListJobs(ctx context.Context, participant string, page, pageSize
 			WHERE p.job_id = j.id AND p.participant = ?)`
 	}
 	listQuery += ` ORDER BY j.id COLLATE BINARY LIMIT ? OFFSET ?`
-	queryArgs := append(append([]any(nil), args...), pageSize, (page-1)*pageSize)
+	queryArgs := append(append([]any(nil), args...), pageSize, pageOffset(page, pageSize))
 
 	jobs, err := s.queryJobs(ctx, listQuery, queryArgs...)
 	if err != nil {
 		return nil, 0, err
 	}
 	return jobs, total, nil
+}
+
+// pageOffset converts a 1-based page number into a row offset. The product
+// (page-1)*pageSize can exceed the int64 range for very large pages; the
+// offset saturates at math.MaxInt64, which still lies past every stored row
+// and therefore yields an empty page instead of wrapping to a negative
+// offset (which SQLite would treat as 0, silently returning the first page).
+func pageOffset(page, pageSize int) int64 {
+	p := int64(page) - 1
+	s := int64(pageSize)
+	if s > 0 && p > math.MaxInt64/s {
+		return math.MaxInt64
+	}
+	return p * s
 }
 
 type queryer interface {

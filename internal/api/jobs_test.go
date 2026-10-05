@@ -3,9 +3,11 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -235,6 +237,114 @@ func TestGetJobsPaginationAndOutOfRange(t *testing.T) {
 	}
 }
 
+func TestGetJobsAcceptsLargePageNumbers(t *testing.T) {
+	_, handler := newTestRouter(t)
+
+	bodies := []string{
+		`{"id":"job-a","computation_type":"c","participants":["alice","bob"],"input_refs":["r"]}`,
+		`{"id":"job-b","computation_type":"c","participants":["alice"],"input_refs":["r"]}`,
+		`{"id":"job-c","computation_type":"c","participants":["carol"],"input_refs":["r"]}`,
+	}
+	for _, body := range bodies {
+		if rec := postJobs(handler, body); rec.Code != http.StatusCreated {
+			t.Fatalf("setup: %d %s", rec.Code, rec.Body.String())
+		}
+	}
+
+	type envelope struct {
+		Total int               `json:"total"`
+		Page  int64             `json:"page"`
+		Size  int               `json:"page_size"`
+		Items []json.RawMessage `json:"items"`
+	}
+	maxPage := strconv.Itoa(math.MaxInt)
+	get := func(target string) envelope {
+		t.Helper()
+		rec := getJobs(handler, target)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want 200; body %s", target, rec.Code, rec.Body.String())
+		}
+		var env envelope
+		if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+			t.Fatalf("decode %s: %v", target, err)
+		}
+		if env.Items == nil {
+			t.Fatalf("%s items = null, want []", target)
+		}
+		return env
+	}
+
+	// The largest page this platform can express is a real (empty) position
+	// for every page-size boundary: no truncation, no wrap to page one.
+	for _, size := range []int{1, 2, 100} {
+		env := get("/jobs?page=" + maxPage + "&page_size=" + strconv.Itoa(size))
+		if env.Total != 3 || env.Page != int64(math.MaxInt) || env.Size != size || len(env.Items) != 0 {
+			t.Fatalf("max page size %d = %+v, want empty page echoing the request with total 3", size, env)
+		}
+	}
+
+	// A participant filter keeps its filtered total on the huge page.
+	env := get("/jobs?participant=alice&page=" + maxPage + "&page_size=2")
+	if env.Total != 2 || len(env.Items) != 0 {
+		t.Fatalf("filtered max page = %+v, want total 2 with empty items", env)
+	}
+	env = get("/jobs?participant=nobody&page=" + maxPage)
+	if env.Total != 0 || len(env.Items) != 0 {
+		t.Fatalf("no-match max page = %+v, want total 0 with empty items", env)
+	}
+
+	// The ordinary last page still holds its record; the next page is empty.
+	env = get("/jobs?page=2&page_size=2")
+	if env.Total != 3 || len(env.Items) != 1 {
+		t.Fatalf("last page = %+v, want one item with total 3", env)
+	}
+	var last struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(env.Items[0], &last); err != nil || last.ID != "job-c" {
+		t.Fatalf("last page item = %s, want job-c", env.Items[0])
+	}
+	env = get("/jobs?page=3&page_size=2")
+	if env.Total != 3 || len(env.Items) != 0 {
+		t.Fatalf("page after last = %+v, want empty with total 3", env)
+	}
+
+	// Leading zeros parse as the numeric value and echo that value back.
+	env = get("/jobs?page=0002&page_size=2")
+	if env.Page != 2 || env.Total != 3 || len(env.Items) != 1 {
+		t.Fatalf("leading-zero page = %+v, want page 2 with one item", env)
+	}
+
+	// None of the queries above may disturb stored content, stage or history.
+	first := get("/jobs")
+	want := []string{
+		`{"id":"job-a","computation_type":"c","participants":["alice","bob"],"input_refs":["r"],"stage":"registered","history":[{"stage":"registered"}]}`,
+		`{"id":"job-b","computation_type":"c","participants":["alice"],"input_refs":["r"],"stage":"registered","history":[{"stage":"registered"}]}`,
+		`{"id":"job-c","computation_type":"c","participants":["carol"],"input_refs":["r"],"stage":"registered","history":[{"stage":"registered"}]}`,
+	}
+	if first.Total != 3 || len(first.Items) != 3 {
+		t.Fatalf("final listing = %+v, want all three jobs", first)
+	}
+	for i, wantJSON := range want {
+		if got := string(first.Items[i]); got != wantJSON {
+			t.Fatalf("job %d changed after queries:\n got %s\nwant %s", i, got, wantJSON)
+		}
+	}
+}
+
+func TestGetJobsEmptyStoreServesHugePage(t *testing.T) {
+	_, handler := newTestRouter(t)
+
+	rec := getJobs(handler, "/jobs?page="+strconv.Itoa(math.MaxInt)+"&page_size=100")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", rec.Code, rec.Body.String())
+	}
+	want := `{"items":[],"page":` + strconv.Itoa(math.MaxInt) + `,"page_size":100,"total":0}`
+	if got := rec.Body.String(); got != want {
+		t.Fatalf("empty-store max page = %s, want %s", got, want)
+	}
+}
+
 func TestGetJobsRejectsInvalidPaging(t *testing.T) {
 	_, handler := newTestRouter(t)
 
@@ -249,6 +359,7 @@ func TestGetJobsRejectsInvalidPaging(t *testing.T) {
 		"/jobs?page_size=101",
 		"/jobs?page_size=x",
 		"/jobs?page_size=2.0",
+		"/jobs?page=9223372036854775808",
 	} {
 		rec := getJobs(handler, target)
 		if rec.Code != http.StatusBadRequest {
@@ -306,6 +417,31 @@ func TestJobsEndpointsReturn503WhenStorageDown(t *testing.T) {
 		t.Fatalf("get status = %d, want 503", get.Code)
 	}
 	assertErrorCode(t, get, "storage_unavailable")
+	var body struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(get.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode 503 body: %v", err)
+	}
+	if body.Error.Message != "database is not available" {
+		t.Fatalf("503 message = %q, want %q", body.Error.Message, "database is not available")
+	}
+
+	// A legal huge page still reaches storage and reports 503, while invalid
+	// parameters are rejected with 400 before storage is consulted.
+	huge := getJobs(handler, "/jobs?page="+strconv.Itoa(math.MaxInt)+"&page_size=2")
+	if huge.Code != http.StatusServiceUnavailable {
+		t.Fatalf("huge page status = %d, want 503", huge.Code)
+	}
+	assertErrorCode(t, huge, "storage_unavailable")
+
+	invalid := getJobs(handler, "/jobs?page=abc")
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid page with storage down status = %d, want 400", invalid.Code)
+	}
+	assertErrorCode(t, invalid, "invalid_request")
 }
 
 func TestOverlappingPostRequestsLeaveSingleRecord(t *testing.T) {

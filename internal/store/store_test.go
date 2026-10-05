@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"math"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -190,6 +191,50 @@ func TestListJobsOrdersByUTF8BytesAndPaginates(t *testing.T) {
 	}
 	if len(page3) != 0 {
 		t.Fatalf("out-of-range page = %v, want empty", idsOf(page3))
+	}
+}
+
+func TestListJobsHugePageReturnsEmptyWithTotal(t *testing.T) {
+	st := openStore(t)
+	ctx := context.Background()
+
+	for _, id := range []string{"job-a", "job-b", "job-c"} {
+		reg := sampleRegistration()
+		reg.ID = id
+		if _, _, err := st.RegisterJob(ctx, reg); err != nil {
+			t.Fatalf("register %s: %v", id, err)
+		}
+	}
+
+	// The largest page this platform can express must not wrap the offset
+	// back onto real rows, whatever the page size.
+	for _, pageSize := range []int{1, 2, 100} {
+		jobs, total, err := st.ListJobs(ctx, "", math.MaxInt, pageSize)
+		if err != nil {
+			t.Fatalf("list max page size %d: %v", pageSize, err)
+		}
+		if total != 3 || len(jobs) != 0 {
+			t.Fatalf("max page size %d = %v (total %d), want empty page with total 3",
+				pageSize, idsOf(jobs), total)
+		}
+	}
+
+	// A participant filter keeps its filtered total on the huge page.
+	jobs, total, err := st.ListJobs(ctx, "alice", math.MaxInt, 2)
+	if err != nil {
+		t.Fatalf("filtered list: %v", err)
+	}
+	if total != 3 || len(jobs) != 0 {
+		t.Fatalf("filtered max page = %v (total %d), want empty with total 3", idsOf(jobs), total)
+	}
+
+	// A filter matching nothing reports total 0.
+	jobs, total, err = st.ListJobs(ctx, "nobody", math.MaxInt, 2)
+	if err != nil {
+		t.Fatalf("no-match list: %v", err)
+	}
+	if total != 0 || len(jobs) != 0 {
+		t.Fatalf("no-match max page = %v (total %d), want empty with total 0", idsOf(jobs), total)
 	}
 }
 
